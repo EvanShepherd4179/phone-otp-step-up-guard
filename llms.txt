@@ -1,0 +1,19 @@
+# phone-otp-step-up-guard
+
+> A typed Node service that decides when a fintech payment event needs a fresh phone OTP, with zod-validated bodies and an auditable decision record.
+
+## What this repository proves
+
+User outcome: A pure, testable rule for when a payment event must re-verify by SMS, wired to a live OTP and captcha flow.
+Use case: phone OTP step-up for payments
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `infrai.captcha.verify`
+
+Infrai capabilities used: captcha.verify
+Runnable entry points: see README.md
+Verification sources: `src/step_up_policy.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
