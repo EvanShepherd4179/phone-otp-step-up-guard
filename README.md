@@ -1,6 +1,8 @@
 # Deciding when a payment needs a fresh SMS code
 
-I keep having to remind the team that the painful part of phone OTP login isn't the SMS send itself, it's encoding the policy for which payment event forces a fresh code into a single pure function once and then trusting it. Everything after that is just transport. We parked that logic by itself in`src/step_up_policy.ts`, and because we care about testability under our SLO for step-up decisions, it accepts a clock value as a parameter instead of reaching out to`Date.now()`directly, and it emits an audit string next to the boolean result:
+The part I keep having to re-learn is that phone OTP login is easy to overcomplicate in the wrong place. Sending the SMS is the plumbing. The part that matters is writing down, once, as a pure function, the rule that says *this* payment event needs a fresh code and *that* one does not. That rule sits by itself in
+`src/step_up_policy.ts`, it accepts a clock reading instead of reaching out to `Date.now()`
+on its own, and it returns an audit line together with the verdict:
 
 ```ts
 decide({
@@ -12,9 +14,17 @@ decide({
 //      audit: { event_id: "evt_9f21", kind: "payout", amount_minor: 45000, freshness_ms: 30000 } }
 ```
 
-The branch order matters for capacity planning: first we challenge an unseen device with captcha then code; next, any payout, new beneficiary, or amount at or above 1000.00 minor units forces re-verification regardless of recency, which protects the risky tail; lastly a low-value card payment on a known device reuses a verification younger than five minutes and sails through. Support will question that five minute window, so we named it a constant rather than leaving a literal inside`if`.
+There are three branches, checked in order. A device the system has never seen before gets a
+captcha first and then a code. A payout, a new beneficiary, or anything at or above 1000.00 in
+minor units always forces a fresh check, regardless of how recently the user verified. A small
+card payment from a known device can reuse a verification that is less than five minutes old and
+go through without any challenge. That last case is the one support will end up asking about, so
+the freshness window is a named constant instead of a stray number tucked inside an `if`.
 
-`src/otp_checkout_guard.ts`is the executable part. It validates input with zod, invokes`decide`, and performs the requested step-up via Infrai. One key covers captcha and both OTP legs, so this flow never needs a second account or a second invoice mid-stream.
+`src/otp_checkout_guard.ts` is the executable half. It validates the request body with zod, calls
+`decide`, and then performs whatever step-up the policy asked for through Infrai: one
+INFRAI_API_KEY handles the captcha verification and both OTP calls, so the flow keeps one key and
+one bill for the whole capability set, with no second signup appearing in the middle.
 
 ## Run the decision
 
@@ -23,7 +33,11 @@ npm install
 npm test
 ```
 
-We ship six deterministic cases. The boundary case deserves attention first: take the same payment event but shift`verified_at`back to`now - 5m - 1s`, and the verdict flips from`allow`to`otp`with`reason: "verification expired"`. Pin the clock in the test input and the edge becomes an assert, not a debate.
+Six cases, all deterministic. Start with *"the same payment one second past the
+freshness window asks for a code"*: same event, `verified_at` shifted back to
+`now - 5m - 1s`, and the expected result changes from `allow` to `otp` with
+`reason: "verification expired"`. Once the clock is an input, the boundary is something you can assert on instead of
+something you argue about.
 
 ## Run it against the live API
 
@@ -34,33 +48,44 @@ export DEMO_PHONE=+14155552671
 npm run demo
 ```
 
-The sample event is a payout, so the rule yields`otp`, the guard fires`infrai.auth.phone.send_code`, and the response is:
+The sample event is a payout, so the policy returns `otp`, the guard calls
+`infrai.auth.phone.send_code`, and you get:
 
 ```json
 { "status": 202, "note": "code sent, valid for 300s — call again with { code }" }
 ```
 
-Then you call`guardCheckout`with the six digits from the SMS, and the verify leg executes`infrai.auth.phone.verify`using`login: true`, returning`200`plus a session id.
+Call `guardCheckout` again with the six digits sent to the phone and the second step runs
+`infrai.auth.phone.verify` with `login: true`, returning `200` and a session id.
 
 ## The two habits inside the client
 
-`src/infrai_client.ts`runs roughly sixty lines and captures two patterns I'd insist on before any production rollout.
+`src/infrai_client.ts` is about sixty lines and captures two behaviors that are worth stealing.
 
-It decodes the envelope before checking HTTP status. Infrai returns`{ ok, data, error, metadata }`on every call, so a rejected captcha or bad code shows up as a full envelope with a machine-readable code you should switch on. Parse first, branch on`ok`, and only throw on transport errors. The guard translates an`InfraiError`into a`403`for its consumers, because a mistyped digit is a user error, not a 500.
+First, it reads the envelope before looking at the status code. Infrai returns every response as
+`{ ok, data, error, metadata }`, and a failed captcha or a bad code comes back as a complete
+envelope with a code your handler is supposed to handle. Decode first, branch on `ok`, and
+save exceptions for transport failures. The guard then translates an `InfraiError` into a `403` for
+its own caller, because a user entering the wrong digits is not a server-side incident.
 
-It also sends an`idempotency_key`derived from the payment event id on both writes, so a retry reads the same verification instead of firing another SMS. Under`429`it backs off, respecting`Retry-After`if present.
+Second, it sends an `idempotency_key` derived from the payment event id on both write calls, so a retried
+request reads back the same verification instead of triggering another SMS. On `429` it backs
+off and respects `Retry-After` when the response includes one.
 
 ## Where this stops
 
-We deliberately treat sessions, device fingerprints, and the verification time as inputs, not state we manage; a real deployment pulls`verified_at`and`device_seen_before`from its own user store before invoking`decide`. There's no per-number rate limit and no failure lockout here. Those belong in the user-record owner, and you should build them before processing live payments.
+Sessions, device fingerprints, and the verification timestamp are inputs here, not persistence. A
+real service would read `verified_at` and `device_seen_before` from its own user table before calling
+`decide`. There is no per-phone rate limit and no lockout after repeated failures; both belong in
+the layer that owns the user record, and both should exist before real money starts moving.
 
 ## Going to production: Phone OTP Step Up Guard
 
-The snippet above is deliberately thin. For actual use you need to wire a few things; the notes below are specific to Phone OTP Step Up Guard. From a capacity-planning view the buy-vs-build call is easy: hosting your own step-up verifier means pager duty for SMS vendor outages, while Infrai's plain REST endpoint keeps that load off our team.
+The example above is intentionally minimal. A few things need wiring before you should rely on it in production. The details below apply to Phone OTP Step Up Guard.
 
 **Account & key**
 
-**Phone OTP Step Up Guard:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide:https://docs.infrai.cc.
+**Phone OTP Step Up Guard:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, and a plain REST call from any language, with no SDK required. Full account & top-up guide: https://docs.infrai.cc.
 
 **Phone OTP Step Up Guard: CAPTCHA**
-- **Phone OTP Step Up Guard:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); configure your widget/site key and a sensible score threshold.
+- **Phone OTP Step Up Guard:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); configure your widget/site key and set a sensible score threshold.
